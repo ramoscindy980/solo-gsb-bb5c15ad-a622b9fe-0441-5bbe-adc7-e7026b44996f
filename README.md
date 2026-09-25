@@ -37,6 +37,17 @@
 边界不会误判；缺版本或箱号返回 `404`，空区间返回空段。全程只读，保留现有
 校准及全部分析结果。
 
+此外支持**多箱设备补报调度预览**：`POST /retransmission-preview` 给出
+**1～4 个互异箱号及 1～10 的整数权重**、各箱共同序号闭区间
+（非负、每箱最多 60 个序号）、**单指令最大连续长度（1～20）**、
+**固定握手开销（0～20）**与**总传输预算（0～200）**；服务依据现有事件表逐箱
+找出区间缺号（**从未上报的箱按整个指定区间缺报处理**）。一条指令只能请求
+**同箱一段连续缺号**，不能跨越已收到的序号；指令消耗 = 握手开销 + 请求长度。
+在预算内最大化**“补报序号数 × 该箱权重”之和**；同分先选**指令数更少**的方案，
+仍同分再按全部指令的 `(箱号, 起点, 终点)` 字典序确定唯一方案。返回请求指令、
+预算消耗与各箱调度后仍缺报区间。乱序补报后重查即按最新数据重算，
+**预览只即时计算，不写库、不触发任何补报**。
+
 ## 目录结构
 
 ```
@@ -47,7 +58,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent、交接快照、温度漂移校准模型，(box_code, seq)、handoff_code、(box_code, version) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、校准版本切换影响审计、群体遥测静默检测
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、校准版本切换影响审计、群体遥测静默检测、多箱补报调度预览
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -134,6 +145,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/calibration-trajectory` | 指定版本与序号区间的校准轨迹（锚点间按序号线性插值，不改原始记录） |
 | GET  | `/boxes/{box_code}/calibration-impact` | 校准版本切换影响审计：两版锚点分别插值判结论，合成结论改变的影响段（精确数值，只读） |
 | GET  | `/telemetry-outages` | 多箱群体遥测静默检测（端点扫描，输出同时静默箱数达标的极大时间段与峰值，只读） |
+| POST | `/retransmission-preview` | 多箱设备补报调度预览（预算内最大化加权补报序号数，返回指令/预算消耗/仍缺报区间，只读不写库） |
 
 ### 上报事件
 
@@ -1306,6 +1318,147 @@ curl -i -G 'http://localhost:8000/telemetry-outages' \
   --data-urlencode 'max_silence_seconds=0' --data-urlencode 'min_simultaneous_boxes=1'
 ```
 
+## 多箱设备补报调度预览（retransmission-preview）
+
+`POST /retransmission-preview`（默认访问端口 **8000**，
+如 `http://localhost:8000/retransmission-preview`）针对 **1～4 台**周转箱的缺号
+情况，在**总传输预算**内规划一组补报请求指令。全程**只读**：只读取现有事件表
+即时计算，**不写库、不触发任何补报**，乱序补报后重查即按最新数据重算。
+
+缺号与指令规则：
+
+- 依据事件表找出各箱在**共同序号闭区间 `[seq_from, seq_to]`**（非负整数、含端点）
+  内**未收到**的序号；**从未上报过的箱按整个指定区间缺报处理**（不返回 404）。
+- 一条指令只能请求**同一箱的一段连续缺号**，**不能跨越已收到的序号**
+  （遇到已收到序号即断段），请求长度为 **1～`max_command_length`**。
+- 每条指令的**消耗 = `handshake_overhead`（固定握手开销）+ 请求长度**；
+  所有指令消耗之和不得超过 **`budget`（总传输预算）**。
+
+优化目标（按顺序使用以下规则确定**唯一**方案）：
+
+1. 在预算内最大化 **sum(补报缺号数 × 该箱权重)**；
+2. 加权和相同时，**指令条数更少**者优先；
+3. 仍相同时，把全部指令按 `(箱号, 起点, 终点)` 排成序列，取**字典序最小**者
+   （等价于更早的箱号、更早的起点优先；同长度收益下优先把段首单独成条）。
+
+请求体字段与校验（不满足返回 `422`）：
+
+| 字段                   | 取值                                                                 |
+| ---------------------- | -------------------------------------------------------------------- |
+| `boxes`                | 1～4 个箱项；箱号去空白后非空（≤64 字符）且**互异**（重复返回 422）  |
+| `boxes[].box_code`     | 箱号（≤64 字符）                                                     |
+| `boxes[].weight`       | 该箱补报收益权重，**1～10 的整数**                                   |
+| `seq_from` / `seq_to`  | 共同序号闭区间，**非负整数且含端点**，`seq_from <= seq_to`，**区间长度 ≤ 60**（每箱最多 60 个序号） |
+| `max_command_length`   | 单条指令最大连续缺号长度，**1～20 的整数**                           |
+| `handshake_overhead`   | 每条指令的固定握手开销，**0～20 的整数**                             |
+| `budget`               | 总传输预算，**0～200 的整数**                                         |
+
+返回字段：
+
+| 字段                              | 说明                                                                 |
+| --------------------------------- | -------------------------------------------------------------------- |
+| `boxes` / `box_count`             | 参与调度的箱号（按请求顺序）及数量                                   |
+| `seq_from` / `seq_to`             | 本次共同序号区间                                                     |
+| `max_command_length` / `handshake_overhead` / `budget` | 本次使用的长度上限、握手开销与预算                  |
+| `total_missing_count`             | 区间内各箱缺号总数（从未上报的箱按整个区间计）                       |
+| `commands[]`                      | 补报请求指令，按 `(box_code, seq_from, seq_to)` 升序；无可行指令时为 `[]` |
+| `commands[].seq_from/seq_to/length` | 指令请求的连续缺号起止（含）与长度                                 |
+| `commands[].cost`                 | 该指令消耗 = `handshake_overhead + length`                           |
+| `command_count`                   | 指令条数                                                             |
+| `requested_seq_count`             | 各指令请求长度之和                                                   |
+| `budget_used` / `budget_remaining`| 预算消耗与剩余预算                                                   |
+| `total_weighted_score`            | 目标值：补报序号数 × 该箱权重之和                                    |
+| `box_statuses[]`                  | 各箱调度结果（按请求顺序）                                           |
+| `box_statuses[].requested_seq_count` | 本方案为该箱请求补报的缺号数                                      |
+| `box_statuses[].remaining_missing_count` / `remaining_missing_ranges` | 调度后该箱仍缺报的序号数与连续区间（按起点升序，含端点；无缺号为 `[]`） |
+
+```bash
+# 启动（单条命令：依赖安装与建表初始化均在容器启动时自动完成）
+docker compose up -d --build
+
+# BOX-RT 在 0..9 内只收到 0,1,2,8,9（缺 3..7）；BOX-NEW 从未上报（整段缺）
+for s in 0 1 2 8 9; do
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"BOX-RT\",\"seq\":$s,\"temperature\":-5.0,
+         \"event_time\":\"2026-09-25T04:00:00+00:00\"}"
+done
+
+# 两箱权重 3/2；单指令最长 3；握手开销 2；总预算 30
+curl -X POST http://localhost:8000/retransmission-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "boxes": [{"box_code":"BOX-RT","weight":3},{"box_code":"BOX-NEW","weight":2}],
+        "seq_from": 0,
+        "seq_to": 9,
+        "max_command_length": 3,
+        "handshake_overhead": 2,
+        "budget": 30
+      }'
+```
+
+响应（BOX-RT 缺 5 个 -> 2 条成本 9、收益 15；BOX-NEW 缺 10 个 -> 4 条成本 18、
+收益 20；合计成本 27 ≤ 30、加权得分 35，剩余预算 3 不足以再发任何指令。
+同权重同条数下按字典序取起点最早的铺法，因此段首为 1 长度指令而不是“尽量填满”）：
+
+```json
+{
+  "boxes": ["BOX-RT", "BOX-NEW"],
+  "box_count": 2,
+  "seq_from": 0,
+  "seq_to": 9,
+  "max_command_length": 3,
+  "handshake_overhead": 2,
+  "budget": 30,
+  "total_missing_count": 15,
+  "commands": [
+    {"box_code": "BOX-RT", "seq_from": 3, "seq_to": 4, "length": 2, "cost": 4, "weight": 3},
+    {"box_code": "BOX-RT", "seq_from": 5, "seq_to": 7, "length": 3, "cost": 5, "weight": 3},
+    {"box_code": "BOX-NEW", "seq_from": 0, "seq_to": 0, "length": 1, "cost": 3, "weight": 2},
+    {"box_code": "BOX-NEW", "seq_from": 1, "seq_to": 3, "length": 3, "cost": 5, "weight": 2},
+    {"box_code": "BOX-NEW", "seq_from": 4, "seq_to": 6, "length": 3, "cost": 5, "weight": 2},
+    {"box_code": "BOX-NEW", "seq_from": 7, "seq_to": 9, "length": 3, "cost": 5, "weight": 2}
+  ],
+  "command_count": 6,
+  "requested_seq_count": 15,
+  "budget_used": 27,
+  "budget_remaining": 3,
+  "total_weighted_score": 35,
+  "box_statuses": [
+    {"box_code": "BOX-RT", "weight": 3, "requested_seq_count": 5,
+     "remaining_missing_count": 0, "remaining_missing_ranges": []},
+    {"box_code": "BOX-NEW", "weight": 2, "requested_seq_count": 10,
+     "remaining_missing_count": 0, "remaining_missing_ranges": []}
+  ]
+}
+```
+
+```bash
+# 乱序补报后重查即重算（缺号减少）；预览不写库，未请求的缺号仍缺
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-RT","seq":3,"temperature":-5.0,
+       "event_time":"2026-09-25T04:00:00+00:00"}'
+curl -X POST http://localhost:8000/retransmission-preview -H 'Content-Type: application/json' \
+  -d '{"boxes":[{"box_code":"BOX-RT","weight":3}],"seq_from":0,"seq_to":9,
+       "max_command_length":3,"handshake_overhead":2,"budget":30}'
+# BOX-RT 此时仅缺 4..7，total_missing_count=4，指令为 (4,4)(5,7)
+
+# 预算为 0（或没有可负担的指令）-> commands=[]、budget_used=0，
+# 各箱仍缺报区间按整段返回
+curl -X POST http://localhost:8000/retransmission-preview -H 'Content-Type: application/json' \
+  -d '{"boxes":[{"box_code":"BOX-RT","weight":3}],"seq_from":0,"seq_to":9,
+       "max_command_length":3,"handshake_overhead":0,"budget":0}'
+
+# 参数非法：箱号重复、超过 4 箱、权重超界、区间长于 60、seq_from>seq_to、
+# max_command_length/handshake_overhead/budget 越界等 -> 422
+curl -i -X POST http://localhost:8000/retransmission-preview -H 'Content-Type: application/json' \
+  -d '{"boxes":[{"box_code":"A","weight":1},{"box_code":"A","weight":2}],
+       "seq_from":0,"seq_to":9,"max_command_length":3,
+       "handshake_overhead":0,"budget":10}'
+curl -i -X POST http://localhost:8000/retransmission-preview -H 'Content-Type: application/json' \
+  -d '{"boxes":[{"box_code":"A","weight":1}],"seq_from":0,"seq_to":60,
+       "max_command_length":3,"handshake_overhead":0,"budget":10}'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -1387,6 +1540,16 @@ curl -i -G 'http://localhost:8000/telemetry-outages' \
   计数），相邻事件点之间同时静默箱数恒定为一个基本段；把端点相接的合格基本段
   直接并入同一个未闭合段，即得到同时静默数达标的极大时间段，段内峰值同时静默
   箱数在扫描中维护。全程只读 `box_events`，不写库，补报后重查即重算。
+- **补报调度预览只读**：`/retransmission-preview` 一次查出 1～4 个箱在共同闭区间
+  内已收到的序号求缺号（从未上报的箱按整个区间缺报，不返回 404）。指令不能跨
+  已收到序号，故先把每箱缺号切成极大连续段：段内用 DP 求各补报数 `m` 的
+  “指令数最少、同数指令序列字典序最小”铺法（只从段首连续铺，段首尽量早的铺法
+  在同指令数下天然字典序最小），再按段独立合并成整箱方案。跨箱在“已耗成本”
+  上做前向 DP：同一成本下按（加权收益降序、指令数升序、指令三元组字典序升序）
+  只保留支配方案——后缀箱的选择对同成本方案完全相同且可加，被支配方案不可能
+  反超；最终在全部成本状态中按同一字典键取唯一最优。状态规模受
+  4 箱 × 60 序号 × 200 预算约束，计算量很小。预览只读取 `box_events`，
+  **不写库、不触发补报**，乱序补报后重查即重算。
 - **校验错误兜底**：请求体携带 `NaN`/`Infinity` 时，校验错误的详情里会带上这些
   非有限浮点，而 Starlette 的 JSON 响应不允许序列化它们；`main.py` 自定义了
   `RequestValidationError` 处理器，先把错误详情中的 NaN/Inf 替换为字符串再返回 422，

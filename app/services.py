@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测、多箱补报调度预览。"""
 import hashlib
 import json
 import math
@@ -1521,4 +1521,218 @@ def telemetry_outages(
         min_simultaneous_boxes=min_simultaneous_boxes,
         outage_count=len(outages),
         outages=outages,
+    )
+
+
+
+def _missing_runs(
+    received: set[int], seq_from: int, seq_to: int
+) -> list[tuple[int, int]]:
+    """闭区间 [seq_from, seq_to] 内未收到序号的极大连续段，按起点升序。
+
+    received 为该箱在区间内已收到的序号集合；从未上报的箱集合为空，
+    整个指定区间按一个缺号段处理。
+    """
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for seq in range(seq_from, seq_to + 1):
+        if seq not in received:
+            if start is None:
+                start = seq
+        elif start is not None:
+            runs.append((start, seq - 1))
+            start = None
+    if start is not None:
+        runs.append((start, seq_to))
+    return runs
+
+
+def _run_command_options(
+    run: tuple[int, int], max_command_length: int
+) -> dict[int, tuple[int, tuple[tuple[int, int], ...]]]:
+    """单个连续缺号段上，覆盖段内前 m 个缺号的最优指令集合（m=0..段长）。
+
+    一条指令只能取长度 1..max_command_length 的连续缺号；指令端点为绝对序号。
+    返回 {m: (指令数, 指令端点元组（按起点升序）)}：
+    同 m 只保留指令数最少者；指令数也相同取指令序列字典序最小者
+    （等价于每条指令尽量填满，起点尽量早）。
+    """
+    run_start, run_end = run
+    run_length = run_end - run_start + 1
+    best: dict[int, tuple[int, tuple[tuple[int, int], ...]]] = {0: (0, ())}
+    for i in range(1, run_length + 1):
+        chosen: tuple[int, tuple[tuple[int, int], ...]] | None = None
+        for j in range(max(0, i - max_command_length), i):
+            prev_count, prev_cmds = best[j]
+            candidate = (
+                prev_count + 1,
+                prev_cmds + ((run_start + j, run_start + i - 1),),
+            )
+            if chosen is None or candidate < chosen:
+                chosen = candidate
+        best[i] = chosen  # type: ignore[assignment]
+    return best
+
+
+def _box_command_options(
+    runs: list[tuple[int, int]], max_command_length: int
+) -> dict[int, tuple[int, tuple[tuple[int, int], ...]]]:
+    """整箱各补报数 m 的最优指令方案。
+
+    指令不能跨已收到序号，故各缺号段相互独立，逐段合并即可。
+    返回 {m: (指令数, 指令端点元组（按起点升序）)}：同 m 只保留指令数最少者，
+    指令数相同取指令序列字典序最小者（追加相同后缀不改变字典序关系，
+    故按段逐步择优安全）。m=0 为不请求。
+    """
+    merged: dict[int, tuple[int, tuple[tuple[int, int], ...]]] = {0: (0, ())}
+    for run in runs:
+        run_opts = _run_command_options(run, max_command_length)
+        updated: dict[int, tuple[int, tuple[tuple[int, int], ...]]] = {}
+        for used_count, (used_n, used_tuple) in merged.items():
+            for take, (add_n, add_tuple) in run_opts.items():
+                m = used_count + take
+                candidate = (used_n + add_n, used_tuple + add_tuple)
+                current = updated.get(m)
+                if current is None or candidate < current:
+                    updated[m] = candidate
+        merged = updated
+    return merged
+
+
+def retransmission_preview(
+    db: Session,
+    boxes: list[schemas.RetransmissionBoxIn],
+    seq_from: int,
+    seq_to: int,
+    max_command_length: int,
+    handshake_overhead: int,
+    budget: int,
+) -> schemas.RetransmissionPreviewResult:
+    """多箱补报调度预览（只读即时计算，不写库、不触发任何补报）。
+
+    - 一次性查出各箱在共同闭区间 [seq_from, seq_to] 内已收到的序号求缺号；
+      从未上报过的箱按整个区间缺报处理（不返回 404），乱序补报后重查即重算
+    - 一条指令只能请求同箱一段连续缺号，不能跨越已收到序号，长度不超过
+      max_command_length；消耗 = handshake_overhead + 请求长度
+    - 目标：总消耗 <= budget 内最大化 sum(补报缺号数 × 该箱权重)；
+      同分（加权和相同）取指令数更少者；仍同分按全部指令的
+      (箱号, 起点, 终点) 序列字典序取唯一方案
+
+    实现：箱按箱号升序处理（拼出的指令元组天然按 (箱号, 起点, 终点) 升序），
+    逐箱在“已耗成本”上做前向 DP。同一成本下若甲方案收益更高、或收益相同
+    指令数更少、或两者相同而指令元组字典序更小，则乙方案不可能在任何相同
+    后缀选择下反超（后缀对两者完全相同且可加），故每成本只保留一个支配方案。
+    """
+    box_codes = [item.box_code for item in boxes]
+    weights = {item.box_code: item.weight for item in boxes}
+
+    # 1) 一次查出各箱区间内实际已收到的序号（缺号不补点）
+    received_by_box: dict[str, set[int]] = {code: set() for code in box_codes}
+    event_rows = db.execute(
+        select(models.BoxEvent.box_code, models.BoxEvent.seq).where(
+            models.BoxEvent.box_code.in_(box_codes),
+            models.BoxEvent.seq >= seq_from,
+            models.BoxEvent.seq <= seq_to,
+        )
+    ).all()
+    for code, seq in event_rows:
+        received_by_box[code].add(seq)
+
+    # 2) 逐箱求缺号段、各补报数方案；箱按箱号升序处理
+    ordered_codes = sorted(box_codes)
+    runs_by_box: dict[str, list[tuple[int, int]]] = {}
+    options_by_box: dict[
+        str, dict[int, tuple[int, tuple[tuple[int, int], ...]]]
+    ] = {}
+    total_missing = 0
+    for code in ordered_codes:
+        runs = _missing_runs(received_by_box[code], seq_from, seq_to)
+        runs_by_box[code] = runs
+        total_missing += sum(end - start + 1 for start, end in runs)
+        options_by_box[code] = _box_command_options(runs, max_command_length)
+
+    # 3) 前向 DP：dp[已耗成本] = (加权收益, 指令数, 指令三元组元组)
+    #    择优键：收益降序、指令数升序、指令元组字典序升序
+    dp: dict[int, tuple[int, int, tuple]] = {0: (0, 0, ())}
+    for code in ordered_codes:
+        weight = weights[code]
+        nxt: dict[int, tuple[int, int, tuple]] = {}
+        for used_cost, (used_gain, used_n, used_tuple) in dp.items():
+            for m, (cmd_n, cmd_tuple) in options_by_box[code].items():
+                total_cost = used_cost + handshake_overhead * cmd_n + m
+                if total_cost > budget:
+                    continue
+                candidate = (
+                    used_gain + weight * m,
+                    used_n + cmd_n,
+                    used_tuple
+                    + tuple((code, s, e) for s, e in cmd_tuple),
+                )
+                current = nxt.get(total_cost)
+                if current is None or (
+                    -candidate[0], candidate[1], candidate[2]
+                ) < (-current[0], current[1], current[2]):
+                    nxt[total_cost] = candidate
+        dp = nxt
+
+    best_cost, (best_gain, best_cmd_n, chosen_tuple) = min(
+        dp.items(), key=lambda kv: (-kv[1][0], kv[1][1], kv[1][2])
+    )
+
+    # 4) 组装响应：指令已按 (箱号, 起点, 终点) 升序
+    commands: list[schemas.RetransmissionCommand] = []
+    requested_by_box: dict[str, int] = {code: 0 for code in box_codes}
+    covered_by_box: dict[str, set[int]] = {code: set() for code in box_codes}
+    for code, s, e in chosen_tuple:
+        length = e - s + 1
+        requested_by_box[code] += length
+        covered_by_box[code].update(range(s, e + 1))
+        commands.append(
+            schemas.RetransmissionCommand(
+                box_code=code,
+                seq_from=s,
+                seq_to=e,
+                length=length,
+                cost=handshake_overhead + length,
+                weight=weights[code],
+            )
+        )
+
+    box_statuses: list[schemas.RetransmissionBoxStatus] = []
+    for code in box_codes:
+        # 把本方案请求的缺号视为已补齐，与已收到序号合并后重算仍缺报区间
+        remaining_runs = _missing_runs(
+            received_by_box[code] | covered_by_box[code], seq_from, seq_to
+        )
+        box_statuses.append(
+            schemas.RetransmissionBoxStatus(
+                box_code=code,
+                weight=weights[code],
+                requested_seq_count=requested_by_box[code],
+                remaining_missing_count=sum(
+                    e - s + 1 for s, e in remaining_runs
+                ),
+                remaining_missing_ranges=[
+                    schemas.RetransmissionMissingRange(seq_from=s, seq_to=e)
+                    for s, e in remaining_runs
+                ],
+            )
+        )
+
+    return schemas.RetransmissionPreviewResult(
+        boxes=box_codes,
+        box_count=len(box_codes),
+        seq_from=seq_from,
+        seq_to=seq_to,
+        max_command_length=max_command_length,
+        handshake_overhead=handshake_overhead,
+        budget=budget,
+        total_missing_count=total_missing,
+        commands=commands,
+        command_count=len(commands),
+        requested_seq_count=sum(requested_by_box.values()),
+        budget_used=best_cost,
+        budget_remaining=budget - best_cost,
+        total_weighted_score=best_gain,
+        box_statuses=box_statuses,
     )
