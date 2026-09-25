@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测、多箱补报调度预览。"""
 import hashlib
 import json
 import math
@@ -1399,6 +1399,10 @@ def calibration_impact(
     )
 
 
+# 补报调度预览：共同序号区间每箱最多覆盖的序号数（与 schema 校验一致）
+RETRANSMISSION_MAX_SPAN = 60
+
+
 def telemetry_outages(
     db: Session,
     box_codes: list[str],
@@ -1521,4 +1525,216 @@ def telemetry_outages(
         min_simultaneous_boxes=min_simultaneous_boxes,
         outage_count=len(outages),
         outages=outages,
+    )
+
+
+def _missing_segments(
+    received: set[int], seq_from: int, seq_to: int
+) -> list[tuple[int, int]]:
+    """把闭区间 [seq_from, seq_to] 内未收到的序号合并为极大连续缺号段。
+
+    返回 [(段起点, 段终点), ...]，含端点、按起点升序；received 为空集
+    （箱号从未上报过）时自然得到整个区间一段。
+    """
+    segments: list[tuple[int, int]] = []
+    start: int | None = None
+    for s in range(seq_from, seq_to + 1):
+        if s in received:
+            if start is not None:
+                segments.append((start, s - 1))
+                start = None
+        elif start is None:
+            start = s
+    if start is not None:
+        segments.append((start, seq_to))
+    return segments
+
+
+def _canonical_commands(
+    box_code: str, seg_start: int, k: int, max_len: int
+) -> list[tuple[str, int, int]]:
+    """在缺号段内从段起点覆盖 k 个连续序号的字典序最小指令切分。
+
+    覆盖块固定在段起点（起点越小，(箱号, 起点, 终点) 字典序越小）；
+    q = ceil(k / max_len) 条指令均分覆盖块时，靠前的指令取“剩余序号
+    还能被后续指令装下”的最短长度（终点越小字典序越小），即后载切分：
+    第 i 条长度 = max(1, remaining - (q - i - 1) * max_len)。
+    返回 [(box_code, start_seq, end_seq), ...]，按起点升序。
+    """
+    q = (k + max_len - 1) // max_len
+    commands: list[tuple[str, int, int]] = []
+    start = seg_start
+    remaining = k
+    for i in range(q):
+        rest_after = q - i - 1
+        length = max(1, remaining - rest_after * max_len)
+        commands.append((box_code, start, start + length - 1))
+        start += length
+        remaining -= length
+    return commands
+
+
+def _plan_key(plan: tuple[int, int, tuple]) -> tuple:
+    """方案比较键（取最小者）：收益大者优先，其次指令数少者，再指令列表字典序小者。"""
+    value, command_count, commands = plan
+    return (-value, command_count, commands)
+
+
+def retransmission_preview(
+    db: Session, payload: schemas.RetransmissionPreviewIn
+) -> schemas.RetransmissionPreviewResult:
+    """多箱设备补报调度预览（只读即时计算，不写库、不改任何原始记录）。
+
+    - 依据事件表找出各箱在共同闭区间 [seq_from, seq_to] 内的缺号并合并为
+      极大连续缺号段；从未上报过的箱按整个指定区间缺报处理（不 404）
+    - 一条指令只能请求同箱同段内的连续缺号（不跨已收到的序号），长度
+      1..max_command_length，消耗 = 握手开销 + 请求长度，
+      收益 = 请求长度 × 该箱权重
+    - 同一段内覆盖 k 个序号的最省方式是从段起点连续覆盖、用 ceil(k/m) 条
+      指令（更多指令只增加握手开销，收益不变），因此每段归约为
+      “选 k = 0..段长”的多选背包，按预算做 DP 精确求解
+    - 目标：预算内最大化 Σ(补报序号数 × 箱权重)；同收益选指令总数更少；
+      再按 (箱号, 起点, 终点) 字典序取唯一方案。段按 (箱号, 段起点) 升序
+      处理，指令元组按处理顺序连接即全局字典序，故 DP 中逐状态保字典序
+      最小的指令列表即可得到全局字典序最小方案
+    - 乱序补报后重查即基于最新事件表重算；预览不写库
+    """
+    codes = [b.box_code for b in payload.boxes]
+    weights = {b.box_code: b.weight for b in payload.boxes}
+    seq_from, seq_to = payload.seq_from, payload.seq_to
+    max_len = payload.max_command_length
+    handshake = payload.handshake_cost
+    budget = payload.budget
+
+    # 1) 一次查出所有指定箱在共同区间内的已收到序号（缺号不补点）
+    rows = db.execute(
+        select(models.BoxEvent.box_code, models.BoxEvent.seq).where(
+            models.BoxEvent.box_code.in_(codes),
+            models.BoxEvent.seq >= seq_from,
+            models.BoxEvent.seq <= seq_to,
+        )
+    ).all()
+    received: dict[str, set[int]] = {code: set() for code in codes}
+    for box_code, seq in rows:
+        received[box_code].add(seq)
+
+    # 2) 每箱的极大连续缺号段（从未上报的箱 -> 整个区间一段）
+    segments_by_box = {
+        code: _missing_segments(received[code], seq_from, seq_to) for code in codes
+    }
+
+    # 3) 多选背包 DP：段按 (箱号, 段起点) 升序处理；dp[b] 为恰好消耗 b 的
+    #    最优方案 (收益, 指令数, 指令元组)，按 _plan_key 取最小
+    ordered_segments = [
+        (code, seg_start, seg_end)
+        for code in sorted(codes)
+        for seg_start, seg_end in segments_by_box[code]
+    ]
+    dp: list[tuple[int, int, tuple] | None] = [None] * (budget + 1)
+    dp[0] = (0, 0, ())
+    for code, seg_start, seg_end in ordered_segments:
+        seg_len = seg_end - seg_start + 1
+        weight = weights[code]
+        # 该段选项：k = 0..seg_len 个连续补报序号（k=0 表示不补该段）
+        options: list[tuple[int, int, int, tuple]] = [(0, 0, 0, ())]
+        for k in range(1, min(seg_len, budget) + 1):
+            n_cmd = (k + max_len - 1) // max_len
+            cost = n_cmd * handshake + k
+            if cost > budget:
+                break  # 消耗随 k 严格递增，后面都超预算
+            options.append(
+                (
+                    cost,
+                    k * weight,
+                    n_cmd,
+                    tuple(_canonical_commands(code, seg_start, k, max_len)),
+                )
+            )
+        next_dp: list[tuple[int, int, tuple] | None] = [None] * (budget + 1)
+        for used in range(budget + 1):
+            current = dp[used]
+            if current is None:
+                continue
+            for cost, value, n_cmd, cmds in options:
+                new_used = used + cost
+                if new_used > budget:
+                    continue
+                candidate = (
+                    current[0] + value,
+                    current[1] + n_cmd,
+                    current[2] + cmds,
+                )
+                existing = next_dp[new_used]
+                if existing is None or _plan_key(candidate) < _plan_key(existing):
+                    next_dp[new_used] = candidate
+        dp = next_dp
+
+    best_used, best = min(
+        ((used, plan) for used, plan in enumerate(dp) if plan is not None),
+        key=lambda item: _plan_key(item[1]),
+    )
+    total_value, command_count, chosen = best
+
+    # 4) 组装指令明细（chosen 按段处理顺序已按 (箱号, 起点, 终点) 有序，显式排序兜底）
+    commands: list[schemas.RetransmissionCommand] = []
+    covered_by_box: dict[str, set[int]] = {code: set() for code in codes}
+    covered_count = 0
+    for box_code, start, end in sorted(chosen):
+        length = end - start + 1
+        covered_count += length
+        covered_by_box[box_code].update(range(start, end + 1))
+        commands.append(
+            schemas.RetransmissionCommand(
+                box_code=box_code,
+                start_seq=start,
+                end_seq=end,
+                length=length,
+                cost=handshake + length,
+                value=length * weights[box_code],
+            )
+        )
+
+    # 5) 各箱仍缺报区间 = 调度前缺号段扣除本方案覆盖的序号（按请求顺序列出）
+    box_results: list[schemas.RetransmissionBoxResult] = []
+    for box_in in payload.boxes:
+        code = box_in.box_code
+        missing_count = sum(
+            seg_end - seg_start + 1 for seg_start, seg_end in segments_by_box[code]
+        )
+        remaining_segments = _missing_segments(
+            received[code] | covered_by_box[code], seq_from, seq_to
+        )
+        covered = len(covered_by_box[code])
+        box_results.append(
+            schemas.RetransmissionBoxResult(
+                box_code=code,
+                weight=box_in.weight,
+                missing_count=missing_count,
+                covered_count=covered,
+                covered_value=covered * box_in.weight,
+                remaining_missing_count=missing_count - covered,
+                remaining_missing_ranges=[
+                    schemas.RetransmissionMissingRange(
+                        start_seq=seg_start,
+                        end_seq=seg_end,
+                        length=seg_end - seg_start + 1,
+                    )
+                    for seg_start, seg_end in remaining_segments
+                ],
+            )
+        )
+
+    return schemas.RetransmissionPreviewResult(
+        seq_from=seq_from,
+        seq_to=seq_to,
+        max_command_length=max_len,
+        handshake_cost=handshake,
+        budget=budget,
+        budget_used=best_used,
+        budget_remaining=budget - best_used,
+        total_value=total_value,
+        covered_count=covered_count,
+        command_count=command_count,
+        commands=commands,
+        boxes=box_results,
     )

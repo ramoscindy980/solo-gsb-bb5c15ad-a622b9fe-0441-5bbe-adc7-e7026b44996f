@@ -445,6 +445,106 @@ class CalibrationImpactResult(BaseModel):
     )
 
 
+class RetransmissionBoxIn(BaseModel):
+    box_code: str = Field(..., min_length=1, max_length=64, description="周转箱箱号")
+    weight: int = Field(..., ge=1, le=10, description="该箱补报权重（1~10 的整数）")
+
+    @field_validator("box_code")
+    @classmethod
+    def _strip_box_code(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("box_code 不能为空")
+        return v
+
+
+class RetransmissionPreviewIn(BaseModel):
+    boxes: list[RetransmissionBoxIn] = Field(
+        ..., min_length=1, max_length=4, description="参与调度的箱号及权重，1~4 个且箱号互异"
+    )
+    seq_from: int = Field(..., ge=0, description="共同序号区间起点（含，非负整数）")
+    seq_to: int = Field(..., ge=0, description="共同序号区间终点（含，非负整数）")
+    max_command_length: int = Field(
+        ..., ge=1, le=20, description="单条补报指令最多请求的连续序号个数（1~20）"
+    )
+    handshake_cost: int = Field(
+        ..., ge=0, le=20, description="每条指令的固定握手开销（0~20），指令消耗 = 握手开销 + 请求长度"
+    )
+    budget: int = Field(..., ge=0, le=200, description="总传输预算（0~200），各指令消耗之和不得超过它")
+
+    @model_validator(mode="after")
+    def _check_boxes_and_range(self) -> "RetransmissionPreviewIn":
+        codes = [b.box_code for b in self.boxes]
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for c in codes:
+            if c in seen and c not in duplicates:
+                duplicates.append(c)
+            seen.add(c)
+        if duplicates:
+            raise ValueError(f"箱号列表存在重复：{', '.join(duplicates)}")
+        if self.seq_from > self.seq_to:
+            raise ValueError(
+                f"序号区间起点({self.seq_from})不能大于终点({self.seq_to})"
+            )
+        if self.seq_to - self.seq_from + 1 > 60:
+            raise ValueError(
+                f"共同序号区间 [{self.seq_from}, {self.seq_to}] 含 "
+                f"{self.seq_to - self.seq_from + 1} 个序号，超过每箱最多 60 个的限制"
+            )
+        return self
+
+
+class RetransmissionCommand(BaseModel):
+    box_code: str = Field(..., description="目标箱号")
+    start_seq: int = Field(..., description="请求的起始序号（含）")
+    end_seq: int = Field(..., description="请求的结束序号（含）")
+    length: int = Field(..., description="请求长度（end_seq - start_seq + 1）")
+    cost: int = Field(..., description="该指令消耗（握手开销 + 请求长度）")
+    value: int = Field(..., description="该指令收益（请求长度 × 该箱权重）")
+
+
+class RetransmissionMissingRange(BaseModel):
+    start_seq: int = Field(..., description="仍缺报区间起点（含）")
+    end_seq: int = Field(..., description="仍缺报区间终点（含）")
+    length: int = Field(..., description="该区间缺报序号数")
+
+
+class RetransmissionBoxResult(BaseModel):
+    box_code: str = Field(..., description="箱号（按请求顺序列出）")
+    weight: int = Field(..., description="该箱补报权重")
+    missing_count: int = Field(..., description="调度前区间内缺报序号数（从未上报的箱为整个区间）")
+    covered_count: int = Field(..., description="本方案计划补报的序号数")
+    covered_value: int = Field(..., description="该箱收益（covered_count × weight）")
+    remaining_missing_count: int = Field(..., description="执行本方案后仍缺报的序号数")
+    remaining_missing_ranges: list[RetransmissionMissingRange] = Field(
+        ..., description="执行本方案后该箱仍缺报的连续区间（按起点升序）"
+    )
+
+
+class RetransmissionPreviewResult(BaseModel):
+    seq_from: int = Field(..., description="共同序号区间起点（含）")
+    seq_to: int = Field(..., description="共同序号区间终点（含）")
+    max_command_length: int = Field(..., description="单指令最大连续长度")
+    handshake_cost: int = Field(..., description="每条指令的固定握手开销")
+    budget: int = Field(..., description="总传输预算")
+    budget_used: int = Field(..., description="本方案实际消耗（各指令消耗之和，不超过预算）")
+    budget_remaining: int = Field(..., description="剩余预算（budget - budget_used）")
+    total_value: int = Field(..., description="总收益：各指令（请求长度 × 该箱权重）之和")
+    covered_count: int = Field(..., description="计划补报的序号总数（各指令长度之和）")
+    command_count: int = Field(..., description="指令条数（同收益时取最少）")
+    commands: list[RetransmissionCommand] = Field(
+        ...,
+        description=(
+            "补报指令列表（按箱号、起点、终点字典序排列）：每条只请求同箱连续缺号，"
+            "不跨已收到的序号；预览不写库"
+        ),
+    )
+    boxes: list[RetransmissionBoxResult] = Field(
+        ..., description="各箱缺报与补报结果（按请求顺序列出）"
+    )
+
+
 class TelemetryOutageSegment(BaseModel):
     start_time: datetime = Field(
         ..., description="段起点 UTC 时间（含）：同时静默箱数首次达到要求数量的时刻"

@@ -43,9 +43,13 @@ app = FastAPI(
         "- 校准版本切换影响审计：GET /boxes/{box_code}/calibration-impact 复用两版"
         "已存锚点的序号线性插值分别计算校准温度，按低于下限/区间内（含边界）/高于上限"
         "判结论，只统计结论改变的事件，将序号连续且变化方向相同的事件合成影响段"
-        "（缺号断段，不补点），输出起止序号、事件数、原/新结论及最大校准温差（只读）"
+        "（缺号断段，不补点），输出起止序号、事件数、原/新结论及最大校准温差（只读）\n"
+        "- 多箱补报调度预览：POST /retransmission-preview 对 1~4 箱（各带权重）在"
+        "共同序号闭区间内找缺号，按“指令只请求同箱连续缺号、消耗=握手开销+长度”"
+        "在总预算内最大化 Σ(补报序号数×权重)，同分比指令数、再按箱号/起点/终点"
+        "字典序定唯一方案，返回指令、预算消耗与各箱仍缺报区间（预览不写库）"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -611,3 +615,15 @@ def get_telemetry_outages(
     return services.telemetry_outages(
         db, deduped, seq_from, seq_to, max_silence_seconds, min_simultaneous_boxes
     )
+
+
+@app.post(
+    "/retransmission-preview",
+    tags=["retransmission"],
+    response_model=schemas.RetransmissionPreviewResult,
+    summary="多箱设备补报调度预览（预算内最大化加权补报数，只读不写库）",
+)
+def post_retransmission_preview(
+    payload: schemas.RetransmissionPreviewIn, db: DbSession
+) -> schemas.RetransmissionPreviewResult:
+    return services.retransmission_preview(db, payload)
